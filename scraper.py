@@ -101,6 +101,11 @@ TARGET_SIZES_RE = re.compile(r"\b(38[rls]?|40r?|large|l)\b", re.IGNORECASE)
 STATE_FILE = Path("state/listings.json")
 RECIPIENTS = ["travis.a.hees@gmail.com", "oliviapierce101@gmail.com"]
 
+# Read all secrets at import time so they're visible in logs immediately
+SCRAPER_API_KEY = os.environ.get("SCRAPER_API_KEY", "")
+SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
+FROM_EMAIL = os.environ.get("FROM_EMAIL", "")
+
 # ── Endpoints & headers ───────────────────────────────────────────────────────
 
 # Primary: Poshmark's internal web API (what the browser calls)
@@ -176,6 +181,7 @@ def _find_listing_arrays(obj, _depth: int = 0) -> list[list]:
             results.extend(_find_listing_arrays(item, _depth + 1))
 
     elif isinstance(obj, dict):
+        # Visit likely keys first to surface the main listing array quickly
         priority = (
             "data", "posts", "listings", "results", "items",
             "search_results", "post_refs", "catalog",
@@ -316,11 +322,13 @@ def _fetch_via_scraperapi(designer: str, api_key: str) -> list[dict]:
 
     soup = BeautifulSoup(resp.text, "lxml")
 
+    # Primary parse: __NEXT_DATA__ JSON (reliable, structured)
     script_tag = soup.find("script", id="__NEXT_DATA__")
     if script_tag and script_tag.string:
         try:
             next_data = json.loads(script_tag.string)
 
+            # Log the data shape once so we can diagnose key-path issues
             if designer == DESIGNERS[0]:
                 pp = (next_data.get("props") or {}).get("pageProps") or {}
                 log.info(
@@ -333,6 +341,7 @@ def _fetch_via_scraperapi(designer: str, api_key: str) -> list[dict]:
         except (json.JSONDecodeError, ValueError) as exc:
             log.warning("__NEXT_DATA__ parse error: %s", exc)
 
+    # Last resort: visible card elements
     return _scrape_cards(soup)
 
 
@@ -405,19 +414,21 @@ def fetch_listings(designer: str) -> list[dict]:
     Fetch listings for one designer.
     Tries the direct vm-rest API first; falls back to ScraperAPI if blocked.
     """
+    # ── Strategy 1: direct internal API ──────────────────────────────────────
     try:
         items = _fetch_direct(designer)
         if items:
             log.debug("  direct API → %d items", len(items))
             return items
+        # 200 but empty — still try fallback in case category filter was off
         log.debug("  direct API → 200 but 0 items, trying fallback")
     except requests.HTTPError as exc:
         log.debug("  direct API blocked (%s), using ScraperAPI", exc)
     except Exception as exc:
         log.debug("  direct API error (%s), using ScraperAPI", exc)
 
-    api_key = os.environ.get("SCRAPER_API_KEY", "")
-    if not api_key:
+    # ── Strategy 2: ScraperAPI ────────────────────────────────────────────────
+    if not SCRAPER_API_KEY:
         log.warning(
             "  Direct request failed and SCRAPER_API_KEY is not set. "
             "Add it as a GitHub secret to enable the fallback."
@@ -425,7 +436,7 @@ def fetch_listings(designer: str) -> list[dict]:
         return []
 
     try:
-        items = _fetch_via_scraperapi(designer, api_key)
+        items = _fetch_via_scraperapi(designer, SCRAPER_API_KEY)
         log.debug("  ScraperAPI → %d items", len(items))
         return items
     except Exception as exc:
@@ -649,22 +660,20 @@ def build_html_email(
 
 
 def send_email(subject: str, html_body: str) -> None:
-    api_key = os.environ.get("SENDGRID_API_KEY", "")
-    from_email = os.environ.get("FROM_EMAIL", "")
-    if not api_key:
+    if not SENDGRID_API_KEY:
         raise EnvironmentError("SENDGRID_API_KEY is not set")
-    if not from_email:
+    if not FROM_EMAIL:
         raise EnvironmentError("FROM_EMAIL is not set")
 
     resp = requests.post(
         "https://api.sendgrid.com/v3/mail/send",
         headers={
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {SENDGRID_API_KEY}",
             "Content-Type": "application/json",
         },
         json={
             "personalizations": [{"to": [{"email": a} for a in RECIPIENTS]}],
-            "from": {"email": from_email, "name": "Poshmark Suit Agent"},
+            "from": {"email": FROM_EMAIL, "name": "Poshmark Suit Agent"},
             "subject": subject,
             "content": [{"type": "text/html", "value": html_body}],
         },
@@ -687,7 +696,7 @@ def main() -> None:
     log.info("Poshmark Monitor  —  %s UTC", now.strftime("%Y-%m-%d %H:%M"))
     log.info(
         "Scraper API key present: %s",
-        "yes" if os.environ.get("SCRAPER_API_KEY") else "NO — fallback disabled",
+        "yes" if SCRAPER_API_KEY else "NO — fallback disabled",
     )
     log.info("=" * 60)
 
