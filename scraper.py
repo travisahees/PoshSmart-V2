@@ -2,20 +2,15 @@
 """
 Poshmark Suit & Blazer Monitor Agent
 
-Scrapes Poshmark search pages, diffs against the previous run,
-and emails an HTML digest via SendGrid.
-
-Scraping approach:
-  1. Fetch the Poshmark search page with requests + a browser UA
-  2. Extract the __NEXT_DATA__ <script> JSON blob (Next.js SSR) with
-     BeautifulSoup — this is the most reliable source of structured data
-  3. Walk the entire JSON tree recursively to find listing arrays —
-     no fragile hardcoded key paths
-  4. Fall back to parsing visible card HTML elements if __NEXT_DATA__
-     yields nothing
+Scraping strategy (in order per designer):
+  1. POST to Poshmark's internal web API (vm-rest/posts/search/v2) —
+     same endpoint the browser calls; returns clean JSON directly.
+  2. If that is blocked (403/non-200), route the HTML search page through
+     ScraperAPI (residential IPs — bypasses Cloudflare bot detection) and
+     parse the __NEXT_DATA__ JSON blob embedded by Next.js.
 
 Run:
-    SENDGRID_API_KEY=<key> FROM_EMAIL=<addr> python scraper.py
+    SENDGRID_API_KEY=<key> FROM_EMAIL=<addr> SCRAPER_API_KEY=<key> python scraper.py
 """
 
 import html as html_lib
@@ -27,7 +22,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote, quote_plus
 
 import requests
 from bs4 import BeautifulSoup
@@ -100,21 +95,33 @@ DESIGNERS = [
     "Dunhill",
 ]
 
-# Sizes to keep: 38/38R/38L/38S, 40/40R, Large, standalone L
-# My measurements (for reference only):
-#   shoulder 18.5–19", chest 40", jacket at button 34", sleeve 23", waist 33"
-TARGET_SIZES_RE = re.compile(
-    r"\b(38[rls]?|40r?|large|l)\b",
-    re.IGNORECASE,
-)
+# Sizes: 38/38R/38L/38S, 40/40R, Large, standalone L
+TARGET_SIZES_RE = re.compile(r"\b(38[rls]?|40r?|large|l)\b", re.IGNORECASE)
 
 STATE_FILE = Path("state/listings.json")
-
 RECIPIENTS = ["travis.a.hees@gmail.com", "oliviapierce101@gmail.com"]
 
-# Confirmed-working Poshmark search URL format.
-# category_v2 uses pipe-separated path: Men|Jackets_&_Coats
-SEARCH_URL = (
+# ── Endpoints & headers ───────────────────────────────────────────────────────
+
+# Primary: Poshmark's internal web API (what the browser calls)
+VM_REST_URL = "https://poshmark.com/vm-rest/posts/search/v2"
+
+VM_REST_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Content-Type": "application/json",
+    "Referer": "https://poshmark.com/",
+    "Origin": "https://poshmark.com",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
+# Fallback: HTML search page URL, routed through ScraperAPI
+HTML_SEARCH_URL = (
     "https://poshmark.com/search"
     "?query={query}"
     "&department=Men"
@@ -122,27 +129,11 @@ SEARCH_URL = (
     "&sort_by=added_desc"
 )
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;"
-        "q=0.9,image/avif,image/webp,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-}
+SCRAPER_API_ENDPOINT = "http://api.scraperapi.com/"
 
-SLEEP_BETWEEN_DESIGNERS = 1.5  # seconds
-REQUEST_TIMEOUT = 25            # seconds
+SLEEP_BETWEEN_DESIGNERS = 1.5   # seconds between designers
+DIRECT_TIMEOUT = 20             # seconds for direct requests
+SCRAPER_TIMEOUT = 60            # seconds for ScraperAPI (residential proxy)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 
@@ -155,13 +146,10 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── JSON tree walker ──────────────────────────────────────────────────────────
+# ── JSON helpers ──────────────────────────────────────────────────────────────
 
 def _looks_like_listing(obj: dict) -> bool:
-    """
-    Heuristic: does this dict look like a Poshmark listing?
-    Requires an id-like field plus at least one of title / price / brand.
-    """
+    """True if dict has an id-like key plus at least one content field."""
     has_id = bool(obj.get("id") or obj.get("listing_id") or obj.get("post_id"))
     has_content = bool(
         obj.get("title") or obj.get("price_amount") or obj.get("brand")
@@ -171,10 +159,9 @@ def _looks_like_listing(obj: dict) -> bool:
 
 def _find_listing_arrays(obj, _depth: int = 0) -> list[list]:
     """
-    Recursively walk a decoded-JSON object and return every list that
-    appears to contain Poshmark listing dicts.
-
-    Returns a list of candidate arrays, longest first.
+    Recursively walk any JSON structure and return all lists whose items
+    look like Poshmark listings, sorted longest-first.
+    No hardcoded key paths — works regardless of nesting.
     """
     if _depth > 12:
         return []
@@ -182,18 +169,17 @@ def _find_listing_arrays(obj, _depth: int = 0) -> list[list]:
     results: list[list] = []
 
     if isinstance(obj, list):
-        # Sample up to 3 items to decide if this is a listing array
         samples = [x for x in obj[:3] if isinstance(x, dict)]
         if samples and all(_looks_like_listing(s) for s in samples):
             results.append(obj)
-        # Also recurse into list elements
         for item in obj:
             results.extend(_find_listing_arrays(item, _depth + 1))
 
     elif isinstance(obj, dict):
-        # Prioritise keys that are likely to hold posts/listings
-        priority = ("posts", "listings", "data", "results", "items",
-                    "search_results", "post_refs", "catalog")
+        priority = (
+            "data", "posts", "listings", "results", "items",
+            "search_results", "post_refs", "catalog",
+        )
         visited: set[str] = set()
         for key in priority:
             if key in obj:
@@ -203,7 +189,6 @@ def _find_listing_arrays(obj, _depth: int = 0) -> list[list]:
             if key not in visited:
                 results.extend(_find_listing_arrays(val, _depth + 1))
 
-    # Deduplicate by id() of the list object and sort longest first
     seen: set[int] = set()
     unique: list[list] = []
     for arr in results:
@@ -214,15 +199,9 @@ def _find_listing_arrays(obj, _depth: int = 0) -> list[list]:
     return unique
 
 
-# ── Listing parser ────────────────────────────────────────────────────────────
+# ── Item parser ───────────────────────────────────────────────────────────────
 
 def _parse_price(raw) -> float:
-    """
-    Normalise Poshmark price fields into a float dollar amount.
-      {"val": 12500}      → 125.00  (val is in cents)
-      {"amount": "125"}   → 125.00
-      125 / "125.00"      → 125.00
-    """
     try:
         if isinstance(raw, dict):
             val = raw.get("val")
@@ -238,13 +217,10 @@ def _parse_price(raw) -> float:
 
 
 def _parse_item(item: dict) -> dict | None:
-    """Parse a raw listing dict (from __NEXT_DATA__ or card HTML) into a
-    normalised listing dict."""
+    """Normalise a raw listing dict into our standard shape."""
     try:
         listing_id = (
-            item.get("id")
-            or item.get("listing_id")
-            or item.get("post_id")
+            item.get("id") or item.get("listing_id") or item.get("post_id")
         )
         if not listing_id:
             return None
@@ -271,7 +247,9 @@ def _parse_item(item: dict) -> dict | None:
             "title": str(item.get("title") or "").strip(),
             "brand": str(item.get("brand") or "").strip(),
             "size": str(item.get("size") or "").strip(),
-            "price": _parse_price(item.get("price_amount") or item.get("price") or 0),
+            "price": _parse_price(
+                item.get("price_amount") or item.get("price") or 0
+            ),
             "img_url": img_url,
             "seller": str(seller).strip(),
             "condition": str(item.get("condition") or "").strip(),
@@ -282,22 +260,91 @@ def _parse_item(item: dict) -> dict | None:
         return None
 
 
-# ── HTML card fallback ────────────────────────────────────────────────────────
+def _items_from_json(data: dict | list) -> list[dict]:
+    """Find listing arrays in a JSON blob and return parsed items."""
+    candidates = _find_listing_arrays(data)
+    if not candidates:
+        return []
+    results = []
+    for raw in candidates[0]:
+        parsed = _parse_item(raw)
+        if parsed:
+            results.append(parsed)
+    return results
+
+
+# ── Strategy 1: direct POST to vm-rest internal API ──────────────────────────
+
+def _fetch_direct(designer: str) -> list[dict]:
+    """
+    POST to Poshmark's internal web API — the same endpoint
+    the browser calls on a search page load.
+    """
+    resp = requests.post(
+        VM_REST_URL,
+        headers=VM_REST_HEADERS,
+        json={
+            "filters": {
+                "department": "Men",
+                "category": "Jackets_&_Coats",
+            },
+            "query": designer,
+            "sort_by": "added_desc",
+            "count": 48,
+            "page_type": "posts",
+        },
+        timeout=DIRECT_TIMEOUT,
+    )
+    resp.raise_for_status()
+    return _items_from_json(resp.json())
+
+
+# ── Strategy 2: ScraperAPI → HTML page → __NEXT_DATA__ ───────────────────────
+
+def _fetch_via_scraperapi(designer: str, api_key: str) -> list[dict]:
+    """
+    Fetch the Poshmark search page routed through ScraperAPI residential
+    proxies, then extract listings from the __NEXT_DATA__ JSON blob.
+    """
+    target = HTML_SEARCH_URL.format(query=quote_plus(designer))
+    resp = requests.get(
+        SCRAPER_API_ENDPOINT,
+        params={"api_key": api_key, "url": target},
+        timeout=SCRAPER_TIMEOUT,
+    )
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "lxml")
+
+    script_tag = soup.find("script", id="__NEXT_DATA__")
+    if script_tag and script_tag.string:
+        try:
+            next_data = json.loads(script_tag.string)
+
+            if designer == DESIGNERS[0]:
+                pp = (next_data.get("props") or {}).get("pageProps") or {}
+                log.info(
+                    "__NEXT_DATA__ pageProps keys: %s", list(pp.keys())[:20]
+                )
+
+            items = _items_from_json(next_data)
+            if items:
+                return items
+        except (json.JSONDecodeError, ValueError) as exc:
+            log.warning("__NEXT_DATA__ parse error: %s", exc)
+
+    return _scrape_cards(soup)
+
 
 def _scrape_cards(soup: BeautifulSoup) -> list[dict]:
-    """
-    Last-resort fallback: parse visible listing card HTML elements.
-    Tries several CSS selectors that Poshmark has used historically.
-    """
+    """Parse visible card HTML elements as a last resort."""
     selectors = (
         "[data-et-name='listing']",
         ".card.card--small",
         ".tile__container",
         "[class*='item__details']",
         ".listing-card",
-        "[class*='listing']",
     )
-
     seen_ids: set[str] = set()
     results: list[dict] = []
 
@@ -323,23 +370,21 @@ def _scrape_cards(soup: BeautifulSoup) -> list[dict]:
                         or ""
                     )
 
-                def _text(sel: str) -> str:
+                def _t(sel: str) -> str:
                     el = card.select_one(sel)
                     return el.get_text(strip=True) if el else ""
 
-                price_text = _text("[class*='price']") or _text(".price")
+                price_text = _t("[class*='price']") or _t(".price")
                 price_num = re.sub(r"[^\d.]", "", price_text)
 
                 results.append({
                     "id": listing_id,
-                    "title": _text("[class*='title']") or _text(".title"),
-                    "brand": _text("[class*='brand']") or _text(".brand"),
-                    "size": _text("[class*='size']") or _text(".size"),
+                    "title": _t("[class*='title']") or _t(".title"),
+                    "brand": _t("[class*='brand']") or _t(".brand"),
+                    "size": _t("[class*='size']") or _t(".size"),
                     "price": float(price_num) if price_num else 0.0,
                     "img_url": img_url,
-                    "seller": (
-                        _text("[class*='username']") or _text(".username")
-                    ).lstrip("@"),
+                    "seller": (_t("[class*='username']") or _t(".username")).lstrip("@"),
                     "condition": "",
                     "url": (
                         f"https://poshmark.com{href}"
@@ -348,81 +393,49 @@ def _scrape_cards(soup: BeautifulSoup) -> list[dict]:
                 })
             except Exception as exc:
                 log.debug("Card parse error: %s", exc)
-
         if results:
             break
-
     return results
 
 
-# ── Main per-designer fetch ───────────────────────────────────────────────────
+# ── Per-designer fetch orchestration ─────────────────────────────────────────
 
 def fetch_listings(designer: str) -> list[dict]:
     """
-    Fetch search results for one designer from the Poshmark search page.
-
-    Strategy (in order):
-      1. Parse __NEXT_DATA__ JSON via BeautifulSoup script-tag lookup
-      2. Recursively walk the JSON tree to find listing arrays
-         (no hardcoded key paths — handles any Next.js data shape)
-      3. Fall back to parsing visible card HTML elements
+    Fetch listings for one designer.
+    Tries the direct vm-rest API first; falls back to ScraperAPI if blocked.
     """
-    url = SEARCH_URL.format(query=quote_plus(designer))
-    resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
+    try:
+        items = _fetch_direct(designer)
+        if items:
+            log.debug("  direct API → %d items", len(items))
+            return items
+        log.debug("  direct API → 200 but 0 items, trying fallback")
+    except requests.HTTPError as exc:
+        log.debug("  direct API blocked (%s), using ScraperAPI", exc)
+    except Exception as exc:
+        log.debug("  direct API error (%s), using ScraperAPI", exc)
 
-    soup = BeautifulSoup(resp.text, "lxml")
+    api_key = os.environ.get("SCRAPER_API_KEY", "")
+    if not api_key:
+        log.warning(
+            "  Direct request failed and SCRAPER_API_KEY is not set. "
+            "Add it as a GitHub secret to enable the fallback."
+        )
+        return []
 
-    # ── Strategy 1 & 2: __NEXT_DATA__ JSON + recursive walk ──────────────────
-    script_tag = soup.find("script", id="__NEXT_DATA__")
-    if script_tag and script_tag.string:
-        try:
-            next_data = json.loads(script_tag.string)
-
-            # Log top-level shape once (first designer) to aid debugging
-            if designer == DESIGNERS[0]:
-                top_keys = list(next_data.keys())
-                props_keys = list((next_data.get("props") or {}).keys())
-                pp_keys = list(
-                    ((next_data.get("props") or {}).get("pageProps") or {}).keys()
-                )
-                log.info(
-                    "__NEXT_DATA__ shape — top: %s | props: %s | pageProps: %s",
-                    top_keys, props_keys, pp_keys,
-                )
-
-            candidates = _find_listing_arrays(next_data)
-            if candidates:
-                best = candidates[0]
-                log.debug(
-                    "__NEXT_DATA__ walker found %d candidate arrays; "
-                    "using largest (%d items)",
-                    len(candidates), len(best),
-                )
-                results = []
-                for raw in best:
-                    parsed = _parse_item(raw)
-                    if parsed:
-                        results.append(parsed)
-                if results:
-                    return results
-            else:
-                log.debug("__NEXT_DATA__ walker found no listing arrays")
-
-        except (json.JSONDecodeError, ValueError) as exc:
-            log.warning("__NEXT_DATA__ JSON parse failed: %s", exc)
-    else:
-        log.debug("No <script id='__NEXT_DATA__'> found on page")
-
-    # ── Strategy 3: card HTML fallback ───────────────────────────────────────
-    log.debug("Falling back to card HTML parsing")
-    return _scrape_cards(soup)
+    try:
+        items = _fetch_via_scraperapi(designer, api_key)
+        log.debug("  ScraperAPI → %d items", len(items))
+        return items
+    except Exception as exc:
+        log.warning("  ScraperAPI also failed: %s", exc)
+        return []
 
 
 # ── Size filter ───────────────────────────────────────────────────────────────
 
 def size_matches(listing: dict) -> bool:
-    """Return True if the listing's size or title contains a target size."""
     text = f"{listing.get('size', '')} {listing.get('title', '')}"
     return bool(TARGET_SIZES_RE.search(text))
 
@@ -430,9 +443,6 @@ def size_matches(listing: dict) -> bool:
 # ── Main fetch loop ───────────────────────────────────────────────────────────
 
 def fetch_all_listings() -> dict[str, dict]:
-    """
-    Fetch all designers in sequence, apply size filter, deduplicate by ID.
-    """
     all_listings: dict[str, dict] = {}
     ok = 0
     failures = 0
@@ -451,7 +461,7 @@ def fetch_all_listings() -> dict[str, dict]:
             continue
 
         if not listings:
-            log.info("  → 0 items returned")
+            log.info("  → 0 items")
             continue
 
         ok += 1
@@ -462,29 +472,27 @@ def fetch_all_listings() -> dict[str, dict]:
                 kept += 1
 
         log.info(
-            "  → %d raw items, %d kept after size filter (total: %d)",
+            "  → %d raw, %d kept after size filter (running total: %d)",
             len(listings), kept, len(all_listings),
         )
 
     log.info(
-        "Fetch complete — %d designers returned data, %d failed, "
+        "Fetch complete — %d designers OK, %d failed, "
         "%d unique size-matched listings",
         ok, failures, len(all_listings),
     )
     return all_listings
 
 
-# ── State management ──────────────────────────────────────────────────────────
+# ── State ─────────────────────────────────────────────────────────────────────
 
 def load_state() -> dict[str, dict]:
-    """Load previous listings. Returns empty dict on any error."""
     try:
-        text = STATE_FILE.read_text(encoding="utf-8")
-        data = json.loads(text)
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict):
             log.info("Loaded %d listings from previous state", len(data))
             return data
-        log.warning("State file has unexpected format; starting fresh")
+        log.warning("State file unexpected format; starting fresh")
         return {}
     except FileNotFoundError:
         log.info("No previous state file; starting fresh")
@@ -495,19 +503,16 @@ def load_state() -> dict[str, dict]:
 
 
 def save_state(listings: dict[str, dict]) -> None:
-    """Overwrite state file with current listings."""
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(
-        json.dumps(listings, indent=2, ensure_ascii=False),
-        encoding="utf-8",
+        json.dumps(listings, indent=2, ensure_ascii=False), encoding="utf-8"
     )
     log.info("Saved %d listings to %s", len(listings), STATE_FILE)
 
 
-# ── Email HTML builder ────────────────────────────────────────────────────────
+# ── Email ─────────────────────────────────────────────────────────────────────
 
 def _card_html(listing: dict, is_new: bool) -> str:
-    """Render a single listing as an inline-styled HTML table cell."""
     title_raw = listing.get("title") or ""
     title = html_lib.escape(title_raw[:80] + ("…" if len(title_raw) > 80 else ""))
     brand = html_lib.escape(listing.get("brand") or "")
@@ -552,8 +557,8 @@ def _card_html(listing: dict, is_new: bool) -> str:
         f'<div style="padding:10px 10px 13px;">'
         f"{new_badge}"
         f'<div style="color:#aaa;font-size:10px;font-weight:600;'
-        f"text-transform:uppercase;letter-spacing:.6px;"
-        f'margin-bottom:3px;">{brand}</div>'
+        f"text-transform:uppercase;letter-spacing:.6px;margin-bottom:3px;\">"
+        f"{brand}</div>"
         f'<div style="font-size:13px;font-weight:500;color:#222;'
         f'line-height:1.35;margin-bottom:7px;">{title}</div>'
         f'<table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>'
@@ -567,7 +572,6 @@ def _card_html(listing: dict, is_new: bool) -> str:
 
 
 def _card_grid(listings: list[dict], new_ids: set[str]) -> str:
-    """3-column table grid of listing cards."""
     COLS = 3
     rows: list[str] = []
     for i in range(0, len(listings), COLS):
@@ -580,19 +584,14 @@ def _card_grid(listings: list[dict], new_ids: set[str]) -> str:
 
 
 def build_html_email(
-    all_listings: dict[str, dict],
-    new_ids: set[str],
-    run_date: str,
+    all_listings: dict[str, dict], new_ids: set[str], run_date: str
 ) -> str:
-    """Assemble the full HTML email body with inline styles throughout."""
     all_list = list(all_listings.values())
-    new_list = [lst for lst in all_list if lst["id"] in new_ids]
-    n_total = len(all_list)
-    n_new = len(new_list)
+    new_list = [l for l in all_list if l["id"] in new_ids]
+    n_total, n_new = len(all_list), len(new_list)
 
-    new_section = ""
-    if new_list:
-        new_section = f"""
+    new_section = (
+        f"""
     <h2 style="font-size:15px;font-weight:700;color:#d32f2f;margin:30px 0 12px;
                letter-spacing:.5px;text-transform:uppercase;">
       &#10022; New Since Last Check ({n_new})
@@ -601,6 +600,8 @@ def build_html_email(
       {_card_grid(new_list, new_ids)}
     </table>
     <hr style="border:none;border-top:1px solid #e8e8e8;margin:30px 0;">"""
+        if new_list else ""
+    )
 
     all_section = f"""
     <h2 style="font-size:15px;font-weight:700;color:#333;margin:30px 0 12px;
@@ -613,53 +614,41 @@ def build_html_email(
 
     return f"""<!DOCTYPE html>
 <html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-</head>
-<body style="margin:0;padding:0;background:#f4f1ee;
-             font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f4f1ee;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
 <table width="100%" cellpadding="0" cellspacing="0" border="0">
   <tr><td align="center" style="padding:28px 12px;">
-  <table width="700" cellpadding="0" cellspacing="0" border="0"
-         style="max-width:700px;width:100%;">
+  <table width="700" cellpadding="0" cellspacing="0" border="0" style="max-width:700px;width:100%;">
     <tr>
       <td style="background:#1a1a1a;border-radius:8px 8px 0 0;padding:28px 32px;">
-        <h1 style="margin:0;color:#fff;font-size:22px;font-weight:700;
-                   letter-spacing:-.3px;">Poshmark Suit &amp; Blazer Digest</h1>
+        <h1 style="margin:0;color:#fff;font-size:22px;font-weight:700;letter-spacing:-.3px;">
+          Poshmark Suit &amp; Blazer Digest</h1>
         <p style="margin:7px 0 0;color:#bbb;font-size:13px;">
-          {run_date}
-          &nbsp;&middot;&nbsp; {n_total} listing{'' if n_total == 1 else 's'} found
-          &nbsp;&middot;&nbsp;
+          {run_date} &nbsp;&middot;&nbsp;
+          {n_total} listing{'' if n_total == 1 else 's'} found &nbsp;&middot;&nbsp;
           <span style="color:#ff6b6b;">{n_new} new</span>
         </p>
       </td>
     </tr>
     <tr>
-      <td style="background:#fff;border-radius:0 0 8px 8px;
-                 padding:24px 32px 36px;">
+      <td style="background:#fff;border-radius:0 0 8px 8px;padding:24px 32px 36px;">
         {new_section}
         {all_section}
         <hr style="border:none;border-top:1px solid #eeeeee;margin:36px 0 20px;">
-        <p style="margin:0;font-size:11px;color:#bbb;text-align:center;
-                  line-height:1.6;">
-          Tracking 63 designers
-          &nbsp;&middot;&nbsp; sizes around 38&thinsp;/&thinsp;40 chest
-          &nbsp;&middot;&nbsp; 18.5&ndash;19&Prime; shoulder
+        <p style="margin:0;font-size:11px;color:#bbb;text-align:center;line-height:1.6;">
+          Tracking 63 designers &nbsp;&middot;&nbsp;
+          sizes around 38&thinsp;/&thinsp;40 chest &nbsp;&middot;&nbsp;
+          18.5&ndash;19&Prime; shoulder
         </p>
       </td>
     </tr>
   </table>
   </td></tr>
 </table>
-</body>
-</html>"""
+</body></html>"""
 
-
-# ── SendGrid sender ───────────────────────────────────────────────────────────
 
 def send_email(subject: str, html_body: str) -> None:
-    """Send via SendGrid REST API. Raises on non-202 response."""
     api_key = os.environ.get("SENDGRID_API_KEY", "")
     from_email = os.environ.get("FROM_EMAIL", "")
     if not api_key:
@@ -696,6 +685,10 @@ def main() -> None:
 
     log.info("=" * 60)
     log.info("Poshmark Monitor  —  %s UTC", now.strftime("%Y-%m-%d %H:%M"))
+    log.info(
+        "Scraper API key present: %s",
+        "yes" if os.environ.get("SCRAPER_API_KEY") else "NO — fallback disabled",
+    )
     log.info("=" * 60)
 
     current = fetch_all_listings()
