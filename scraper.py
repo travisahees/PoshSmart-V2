@@ -2,11 +2,17 @@
 """
 Poshmark Suit & Blazer Monitor Agent
 
-Scrapes Poshmark for designer blazer/jacket/suit listings, diffs against
-the previous run, and emails an HTML digest via SendGrid.
+Scrapes Poshmark search pages, diffs against the previous run,
+and emails an HTML digest via SendGrid.
 
-Primary scraping: Poshmark mobile app API (GET /api/posts/search).
-Fallback: requests + BeautifulSoup HTML parsing (also tries __NEXT_DATA__).
+Scraping approach:
+  1. Fetch the Poshmark search page with requests + a browser UA
+  2. Extract the __NEXT_DATA__ <script> JSON blob (Next.js SSR) with
+     BeautifulSoup — this is the most reliable source of structured data
+  3. Walk the entire JSON tree recursively to find listing arrays —
+     no fragile hardcoded key paths
+  4. Fall back to parsing visible card HTML elements if __NEXT_DATA__
+     yields nothing
 
 Run:
     SENDGRID_API_KEY=<key> FROM_EMAIL=<addr> python scraper.py
@@ -106,22 +112,17 @@ STATE_FILE = Path("state/listings.json")
 
 RECIPIENTS = ["travis.a.hees@gmail.com", "oliviapierce101@gmail.com"]
 
-# ── API / HTTP constants ──────────────────────────────────────────────────────
+# Confirmed-working Poshmark search URL format.
+# category_v2 uses pipe-separated path: Men|Jackets_&_Coats
+SEARCH_URL = (
+    "https://poshmark.com/search"
+    "?query={query}"
+    "&department=Men"
+    "&category_v2=Men%7CJackets_%26_Coats"
+    "&sort_by=added_desc"
+)
 
-MOBILE_API_URL = "https://api.poshmark.com/api/posts/search"
-
-MOBILE_HEADERS = {
-    "User-Agent": "Poshmark/20240101 CFNetwork/1492.0.1 Darwin/23.3.0",
-    "Accept": "application/json",
-    "Accept-Language": "en-US",
-    "Content-Type": "application/json",
-    "X-PM-Version": "4.400.0",
-    "X-PM-Platform": "iOS",
-}
-
-HTML_SEARCH_BASE = "https://poshmark.com/search"
-
-HTML_HEADERS = {
+HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -154,15 +155,73 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── Parsing helpers ───────────────────────────────────────────────────────────
+# ── JSON tree walker ──────────────────────────────────────────────────────────
+
+def _looks_like_listing(obj: dict) -> bool:
+    """
+    Heuristic: does this dict look like a Poshmark listing?
+    Requires an id-like field plus at least one of title / price / brand.
+    """
+    has_id = bool(obj.get("id") or obj.get("listing_id") or obj.get("post_id"))
+    has_content = bool(
+        obj.get("title") or obj.get("price_amount") or obj.get("brand")
+    )
+    return has_id and has_content
+
+
+def _find_listing_arrays(obj, _depth: int = 0) -> list[list]:
+    """
+    Recursively walk a decoded-JSON object and return every list that
+    appears to contain Poshmark listing dicts.
+
+    Returns a list of candidate arrays, longest first.
+    """
+    if _depth > 12:
+        return []
+
+    results: list[list] = []
+
+    if isinstance(obj, list):
+        # Sample up to 3 items to decide if this is a listing array
+        samples = [x for x in obj[:3] if isinstance(x, dict)]
+        if samples and all(_looks_like_listing(s) for s in samples):
+            results.append(obj)
+        # Also recurse into list elements
+        for item in obj:
+            results.extend(_find_listing_arrays(item, _depth + 1))
+
+    elif isinstance(obj, dict):
+        # Prioritise keys that are likely to hold posts/listings
+        priority = ("posts", "listings", "data", "results", "items",
+                    "search_results", "post_refs", "catalog")
+        visited: set[str] = set()
+        for key in priority:
+            if key in obj:
+                visited.add(key)
+                results.extend(_find_listing_arrays(obj[key], _depth + 1))
+        for key, val in obj.items():
+            if key not in visited:
+                results.extend(_find_listing_arrays(val, _depth + 1))
+
+    # Deduplicate by id() of the list object and sort longest first
+    seen: set[int] = set()
+    unique: list[list] = []
+    for arr in results:
+        if id(arr) not in seen:
+            seen.add(id(arr))
+            unique.append(arr)
+    unique.sort(key=len, reverse=True)
+    return unique
+
+
+# ── Listing parser ────────────────────────────────────────────────────────────
 
 def _parse_price(raw) -> float:
     """
     Normalise Poshmark price fields into a float dollar amount.
-    Handles:
-      - {"val": 12500}          → 125.00   (val is cents)
-      - {"amount": "125.00"}    → 125.00
-      - 125.00 / "125.00"       → 125.00
+      {"val": 12500}      → 125.00  (val is in cents)
+      {"amount": "125"}   → 125.00
+      125 / "125.00"      → 125.00
     """
     try:
         if isinstance(raw, dict):
@@ -178,8 +237,9 @@ def _parse_price(raw) -> float:
         return 0.0
 
 
-def _parse_api_item(item: dict) -> dict | None:
-    """Parse a single item dict from the Poshmark mobile API response."""
+def _parse_item(item: dict) -> dict | None:
+    """Parse a raw listing dict (from __NEXT_DATA__ or card HTML) into a
+    normalised listing dict."""
     try:
         listing_id = (
             item.get("id")
@@ -189,151 +249,65 @@ def _parse_api_item(item: dict) -> dict | None:
         if not listing_id:
             return None
 
-        pictures = item.get("pictures") or []
+        pictures = item.get("pictures") or item.get("photos") or []
         img_url = ""
         if pictures and isinstance(pictures[0], dict):
             img_url = (
                 pictures[0].get("url_small")
                 or pictures[0].get("url_medium")
                 or pictures[0].get("url_large")
+                or pictures[0].get("url")
                 or ""
             )
+
+        seller_raw = item.get("seller")
+        if isinstance(seller_raw, dict):
+            seller = seller_raw.get("username", "")
+        else:
+            seller = item.get("creator_username") or ""
 
         return {
             "id": str(listing_id),
             "title": str(item.get("title") or "").strip(),
             "brand": str(item.get("brand") or "").strip(),
             "size": str(item.get("size") or "").strip(),
-            "price": _parse_price(item.get("price_amount") or 0),
+            "price": _parse_price(item.get("price_amount") or item.get("price") or 0),
             "img_url": img_url,
-            "seller": str(item.get("creator_username") or "").strip(),
+            "seller": str(seller).strip(),
             "condition": str(item.get("condition") or "").strip(),
             "url": f"https://poshmark.com/listing/{listing_id}",
         }
     except Exception as exc:
-        log.debug("API item parse error: %s", exc)
+        log.debug("Item parse error: %s", exc)
         return None
 
 
-# ── Primary scraper: Poshmark mobile API ─────────────────────────────────────
+# ── HTML card fallback ────────────────────────────────────────────────────────
 
-def fetch_listings_api(designer: str) -> list[dict]:
+def _scrape_cards(soup: BeautifulSoup) -> list[dict]:
     """
-    Call the Poshmark mobile app API for one designer.
-    Returns a list of raw listing dicts, or raises on non-200 / empty data.
+    Last-resort fallback: parse visible listing card HTML elements.
+    Tries several CSS selectors that Poshmark has used historically.
     """
-    params = {
-        "query": designer,
-        "department": "Men",
-        "category": "Jackets_&_Coats",
-        "sort_by": "added_desc",
-        "count": 48,
-        "max_id": "",
-    }
-    resp = requests.get(
-        MOBILE_API_URL,
-        headers=MOBILE_HEADERS,
-        params=params,
-        timeout=REQUEST_TIMEOUT,
-    )
-    resp.raise_for_status()
-
-    data = resp.json()
-    items = data.get("data") or []
-    if not items:
-        return []
-
-    results = []
-    for item in items:
-        parsed = _parse_api_item(item)
-        if parsed:
-            results.append(parsed)
-    return results
-
-
-# ── Fallback scraper: BeautifulSoup HTML parsing ──────────────────────────────
-
-def fetch_listings_html(designer: str) -> list[dict]:
-    """
-    Fallback: scrape the Poshmark web search results page.
-
-    Attempts two sub-strategies in order:
-      1. Extract the __NEXT_DATA__ JSON blob embedded by Next.js (structured data)
-      2. Parse visible .card / tile HTML elements with BeautifulSoup
-    """
-    url = (
-        f"{HTML_SEARCH_BASE}"
-        f"?query={quote_plus(designer)}"
-        "&department=Men"
-        "&category=Jackets_%26_Coats"
-        "&sort_by=added_desc"
-    )
-
-    resp = requests.get(url, headers=HTML_HEADERS, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-
-    # ── Strategy 1: __NEXT_DATA__ JSON (Next.js SSR) ─────────────────────────
-    nd_match = re.search(
-        r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>\s*(\{.*?\})\s*</script>',
-        resp.text,
-        re.DOTALL,
-    )
-    if nd_match:
-        try:
-            next_data = json.loads(nd_match.group(1))
-            page_props = (
-                next_data.get("props", {}).get("pageProps", {})
-            )
-            # Try several known key paths used by Poshmark's Next.js app
-            candidate_paths = [
-                ["posts"],
-                ["listings"],
-                ["searchResults", "posts"],
-                ["data", "posts"],
-                ["initialState", "posts"],
-                ["search", "posts"],
-            ]
-            for path in candidate_paths:
-                node = page_props
-                for key in path:
-                    node = node.get(key) if isinstance(node, dict) else None
-                if isinstance(node, list) and node:
-                    results = []
-                    for item in node:
-                        parsed = _parse_api_item(item)
-                        if parsed:
-                            results.append(parsed)
-                    if results:
-                        log.debug(
-                            "__NEXT_DATA__ path %s → %d items",
-                            ".".join(path), len(results),
-                        )
-                        return results
-        except (json.JSONDecodeError, AttributeError) as exc:
-            log.debug("__NEXT_DATA__ parse failed: %s", exc)
-
-    # ── Strategy 2: parse visible card HTML elements ──────────────────────────
-    soup = BeautifulSoup(resp.text, "lxml")
-    results = []
-
-    card_selectors = (
+    selectors = (
         "[data-et-name='listing']",
         ".card.card--small",
         ".tile__container",
         "[class*='item__details']",
         ".listing-card",
+        "[class*='listing']",
     )
 
     seen_ids: set[str] = set()
-    for selector in card_selectors:
+    results: list[dict] = []
+
+    for selector in selectors:
         for card in soup.select(selector):
             try:
                 a_tag = card.find("a", href=True)
                 href = a_tag["href"] if a_tag else ""
                 if "/listing/" not in href:
                     continue
-
-                # Extract listing id from URL path (last segment)
                 listing_id = href.rstrip("/").rsplit("-", 1)[-1]
                 if not listing_id or listing_id in seen_ids:
                     continue
@@ -349,57 +323,100 @@ def fetch_listings_html(designer: str) -> list[dict]:
                         or ""
                     )
 
-                def _text(selector_str: str) -> str:
-                    el = card.select_one(selector_str)
+                def _text(sel: str) -> str:
+                    el = card.select_one(sel)
                     return el.get_text(strip=True) if el else ""
 
-                title = (
-                    _text(".title")
-                    or _text("[class*='title']")
-                    or _text("[data-et-name='listing_title']")
-                )
-                brand = (
-                    _text(".brand")
-                    or _text("[class*='brand']")
-                )
-                price_text = (
-                    _text("[class*='price']")
-                    or _text(".price")
-                )
+                price_text = _text("[class*='price']") or _text(".price")
                 price_num = re.sub(r"[^\d.]", "", price_text)
-                price = float(price_num) if price_num else 0.0
-
-                size = _text("[class*='size']") or _text(".size")
-                seller = (
-                    _text("[class*='username']")
-                    or _text(".username")
-                    or _text(".seller")
-                ).lstrip("@")
-
-                full_url = (
-                    f"https://poshmark.com{href}"
-                    if href.startswith("/")
-                    else href
-                )
 
                 results.append({
                     "id": listing_id,
-                    "title": title,
-                    "brand": brand,
-                    "size": size,
-                    "price": price,
+                    "title": _text("[class*='title']") or _text(".title"),
+                    "brand": _text("[class*='brand']") or _text(".brand"),
+                    "size": _text("[class*='size']") or _text(".size"),
+                    "price": float(price_num) if price_num else 0.0,
                     "img_url": img_url,
-                    "seller": seller,
+                    "seller": (
+                        _text("[class*='username']") or _text(".username")
+                    ).lstrip("@"),
                     "condition": "",
-                    "url": full_url,
+                    "url": (
+                        f"https://poshmark.com{href}"
+                        if href.startswith("/") else href
+                    ),
                 })
             except Exception as exc:
                 log.debug("Card parse error: %s", exc)
 
         if results:
-            break  # stop trying selectors once we have results
+            break
 
     return results
+
+
+# ── Main per-designer fetch ───────────────────────────────────────────────────
+
+def fetch_listings(designer: str) -> list[dict]:
+    """
+    Fetch search results for one designer from the Poshmark search page.
+
+    Strategy (in order):
+      1. Parse __NEXT_DATA__ JSON via BeautifulSoup script-tag lookup
+      2. Recursively walk the JSON tree to find listing arrays
+         (no hardcoded key paths — handles any Next.js data shape)
+      3. Fall back to parsing visible card HTML elements
+    """
+    url = SEARCH_URL.format(query=quote_plus(designer))
+    resp = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "lxml")
+
+    # ── Strategy 1 & 2: __NEXT_DATA__ JSON + recursive walk ──────────────────
+    script_tag = soup.find("script", id="__NEXT_DATA__")
+    if script_tag and script_tag.string:
+        try:
+            next_data = json.loads(script_tag.string)
+
+            # Log top-level shape once (first designer) to aid debugging
+            if designer == DESIGNERS[0]:
+                top_keys = list(next_data.keys())
+                props_keys = list((next_data.get("props") or {}).keys())
+                pp_keys = list(
+                    ((next_data.get("props") or {}).get("pageProps") or {}).keys()
+                )
+                log.info(
+                    "__NEXT_DATA__ shape — top: %s | props: %s | pageProps: %s",
+                    top_keys, props_keys, pp_keys,
+                )
+
+            candidates = _find_listing_arrays(next_data)
+            if candidates:
+                best = candidates[0]
+                log.debug(
+                    "__NEXT_DATA__ walker found %d candidate arrays; "
+                    "using largest (%d items)",
+                    len(candidates), len(best),
+                )
+                results = []
+                for raw in best:
+                    parsed = _parse_item(raw)
+                    if parsed:
+                        results.append(parsed)
+                if results:
+                    return results
+            else:
+                log.debug("__NEXT_DATA__ walker found no listing arrays")
+
+        except (json.JSONDecodeError, ValueError) as exc:
+            log.warning("__NEXT_DATA__ JSON parse failed: %s", exc)
+    else:
+        log.debug("No <script id='__NEXT_DATA__'> found on page")
+
+    # ── Strategy 3: card HTML fallback ───────────────────────────────────────
+    log.debug("Falling back to card HTML parsing")
+    return _scrape_cards(soup)
 
 
 # ── Size filter ───────────────────────────────────────────────────────────────
@@ -414,12 +431,10 @@ def size_matches(listing: dict) -> bool:
 
 def fetch_all_listings() -> dict[str, dict]:
     """
-    Fetch all designers in sequence, apply size filter, and return a
-    deduplicated dict keyed by listing ID.
+    Fetch all designers in sequence, apply size filter, deduplicate by ID.
     """
     all_listings: dict[str, dict] = {}
-    api_ok = 0
-    html_ok = 0
+    ok = 0
     failures = 0
 
     for idx, designer in enumerate(DESIGNERS):
@@ -428,49 +443,33 @@ def fetch_all_listings() -> dict[str, dict]:
 
         log.info("[%d/%d] %s", idx + 1, len(DESIGNERS), designer)
 
-        listings: list[dict] = []
-
-        # ── Primary: mobile API ──────────────────────────────────────────────
         try:
-            listings = fetch_listings_api(designer)
-            if listings:
-                api_ok += 1
-                log.info("  API → %d raw items", len(listings))
-            else:
-                log.info("  API → 0 items, trying HTML fallback")
+            listings = fetch_listings(designer)
         except Exception as exc:
-            log.warning("  API failed (%s), trying HTML fallback", exc)
+            log.warning("  FAILED (%s)", exc)
+            failures += 1
+            continue
 
-        # ── Fallback: HTML ───────────────────────────────────────────────────
         if not listings:
-            try:
-                listings = fetch_listings_html(designer)
-                if listings:
-                    html_ok += 1
-                    log.info("  HTML → %d raw items", len(listings))
-                else:
-                    log.info("  HTML → 0 items")
-            except Exception as exc:
-                log.warning("  Both methods failed for %r: %s", designer, exc)
-                failures += 1
+            log.info("  → 0 items returned")
+            continue
 
-        # ── Size-filter and deduplicate ──────────────────────────────────────
+        ok += 1
         kept = 0
         for item in listings:
             if size_matches(item) and item["id"] not in all_listings:
                 all_listings[item["id"]] = item
                 kept += 1
 
-        if listings:
-            log.info(
-                "  %d / %d passed size filter (total so far: %d)",
-                kept, len(listings), len(all_listings),
-            )
+        log.info(
+            "  → %d raw items, %d kept after size filter (total: %d)",
+            len(listings), kept, len(all_listings),
+        )
 
     log.info(
-        "Fetch complete — API: %d, HTML fallback: %d, failed: %d, "
-        "total unique size-matched listings: %d",
-        api_ok, html_ok, failures, len(all_listings),
+        "Fetch complete — %d designers returned data, %d failed, "
+        "%d unique size-matched listings",
+        ok, failures, len(all_listings),
     )
     return all_listings
 
@@ -478,10 +477,7 @@ def fetch_all_listings() -> dict[str, dict]:
 # ── State management ──────────────────────────────────────────────────────────
 
 def load_state() -> dict[str, dict]:
-    """
-    Load the previous run's listings from STATE_FILE.
-    Returns an empty dict if the file is missing or corrupt.
-    """
+    """Load previous listings. Returns empty dict on any error."""
     try:
         text = STATE_FILE.read_text(encoding="utf-8")
         data = json.loads(text)
@@ -491,7 +487,7 @@ def load_state() -> dict[str, dict]:
         log.warning("State file has unexpected format; starting fresh")
         return {}
     except FileNotFoundError:
-        log.info("No previous state file found; starting fresh")
+        log.info("No previous state file; starting fresh")
         return {}
     except Exception as exc:
         log.warning("Could not load state (%s); starting fresh", exc)
@@ -499,7 +495,7 @@ def load_state() -> dict[str, dict]:
 
 
 def save_state(listings: dict[str, dict]) -> None:
-    """Overwrite STATE_FILE with the current run's listings."""
+    """Overwrite state file with current listings."""
     STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
     STATE_FILE.write_text(
         json.dumps(listings, indent=2, ensure_ascii=False),
@@ -511,7 +507,7 @@ def save_state(listings: dict[str, dict]) -> None:
 # ── Email HTML builder ────────────────────────────────────────────────────────
 
 def _card_html(listing: dict, is_new: bool) -> str:
-    """Render a single listing as an inline-styled HTML table cell / card."""
+    """Render a single listing as an inline-styled HTML table cell."""
     title_raw = listing.get("title") or ""
     title = html_lib.escape(title_raw[:80] + ("…" if len(title_raw) > 80 else ""))
     brand = html_lib.escape(listing.get("brand") or "")
@@ -522,35 +518,28 @@ def _card_html(listing: dict, is_new: bool) -> str:
     url = html_lib.escape(listing.get("url") or "#")
     img_url = html_lib.escape(listing.get("img_url") or "")
 
-    price_fmt = (
-        f"${price:,.0f}" if price == int(price) else f"${price:,.2f}"
-    )
+    price_fmt = f"${price:,.0f}" if price == int(price) else f"${price:,.2f}"
 
     new_badge = (
         '<span style="display:inline-block;background:#d32f2f;color:#fff;'
         "font-size:9px;font-weight:700;letter-spacing:1.2px;"
         "text-transform:uppercase;padding:2px 6px;border-radius:2px;"
         'margin-bottom:5px;">NEW</span><br>'
-        if is_new
-        else ""
+        if is_new else ""
     )
 
-    if img_url:
-        photo = (
-            f'<img src="{img_url}" width="200" height="200" alt="" '
-            'style="width:100%;height:200px;object-fit:cover;display:block;'
-            'background:#e8e8e8;border-radius:6px 6px 0 0;" />'
-        )
-    else:
-        photo = (
-            '<div style="width:100%;height:200px;background:#e8e8e8;'
-            'border-radius:6px 6px 0 0;"></div>'
-        )
+    photo = (
+        f'<img src="{img_url}" width="200" height="200" alt="" '
+        'style="width:100%;height:200px;object-fit:cover;display:block;'
+        'background:#e8e8e8;border-radius:6px 6px 0 0;" />'
+        if img_url else
+        '<div style="width:100%;height:200px;background:#e8e8e8;'
+        'border-radius:6px 6px 0 0;"></div>'
+    )
 
     cond_span = (
         f'<span style="color:#999;font-size:11px;"> · {condition}</span>'
-        if condition
-        else ""
+        if condition else ""
     )
 
     return (
@@ -567,11 +556,10 @@ def _card_html(listing: dict, is_new: bool) -> str:
         f'margin-bottom:3px;">{brand}</div>'
         f'<div style="font-size:13px;font-weight:500;color:#222;'
         f'line-height:1.35;margin-bottom:7px;">{title}</div>'
-        f'<table width="100%" cellpadding="0" cellspacing="0" border="0">'
-        f"<tr>"
+        f'<table width="100%" cellpadding="0" cellspacing="0" border="0"><tr>'
         f'<td style="font-size:16px;font-weight:700;color:#111;">{price_fmt}</td>'
         f'<td align="right" style="font-size:12px;color:#999;">{size}</td>'
-        f"</tr></table>"
+        f'</tr></table>'
         f'<div style="font-size:11px;color:#bbb;margin-top:5px;">'
         f"@{seller}{cond_span}</div>"
         f"</div></div></a></td>"
@@ -579,13 +567,12 @@ def _card_html(listing: dict, is_new: bool) -> str:
 
 
 def _card_grid(listings: list[dict], new_ids: set[str]) -> str:
-    """Lay out listing cards in a 3-column table grid."""
+    """3-column table grid of listing cards."""
     COLS = 3
     rows: list[str] = []
     for i in range(0, len(listings), COLS):
         chunk = listings[i : i + COLS]
         cells = "".join(_card_html(lst, lst["id"] in new_ids) for lst in chunk)
-        # Pad the last row so it doesn't look broken
         for _ in range(COLS - len(chunk)):
             cells += '<td style="padding:8px;width:216px;"></td>'
         rows.append(f"<tr>{cells}</tr>")
@@ -603,7 +590,6 @@ def build_html_email(
     n_total = len(all_list)
     n_new = len(new_list)
 
-    # ── New listings section ──────────────────────────────────────────────────
     new_section = ""
     if new_list:
         new_section = f"""
@@ -616,7 +602,6 @@ def build_html_email(
     </table>
     <hr style="border:none;border-top:1px solid #e8e8e8;margin:30px 0;">"""
 
-    # ── All listings section ──────────────────────────────────────────────────
     all_section = f"""
     <h2 style="font-size:15px;font-weight:700;color:#333;margin:30px 0 12px;
                letter-spacing:.5px;text-transform:uppercase;">
@@ -636,17 +621,12 @@ def build_html_email(
              font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
 <table width="100%" cellpadding="0" cellspacing="0" border="0">
   <tr><td align="center" style="padding:28px 12px;">
-
   <table width="700" cellpadding="0" cellspacing="0" border="0"
          style="max-width:700px;width:100%;">
-
-    <!-- Header -->
     <tr>
       <td style="background:#1a1a1a;border-radius:8px 8px 0 0;padding:28px 32px;">
         <h1 style="margin:0;color:#fff;font-size:22px;font-weight:700;
-                   letter-spacing:-.3px;">
-          Poshmark Suit &amp; Blazer Digest
-        </h1>
+                   letter-spacing:-.3px;">Poshmark Suit &amp; Blazer Digest</h1>
         <p style="margin:7px 0 0;color:#bbb;font-size:13px;">
           {run_date}
           &nbsp;&middot;&nbsp; {n_total} listing{'' if n_total == 1 else 's'} found
@@ -655,15 +635,11 @@ def build_html_email(
         </p>
       </td>
     </tr>
-
-    <!-- Body -->
     <tr>
       <td style="background:#fff;border-radius:0 0 8px 8px;
                  padding:24px 32px 36px;">
         {new_section}
         {all_section}
-
-        <!-- Footer -->
         <hr style="border:none;border-top:1px solid #eeeeee;margin:36px 0 20px;">
         <p style="margin:0;font-size:11px;color:#bbb;text-align:center;
                   line-height:1.6;">
@@ -673,7 +649,6 @@ def build_html_email(
         </p>
       </td>
     </tr>
-
   </table>
   </td></tr>
 </table>
@@ -681,35 +656,16 @@ def build_html_email(
 </html>"""
 
 
-# ── SendGrid email sender ─────────────────────────────────────────────────────
+# ── SendGrid sender ───────────────────────────────────────────────────────────
 
 def send_email(subject: str, html_body: str) -> None:
-    """
-    Send the HTML digest to all RECIPIENTS via the SendGrid REST API.
-    Raises RuntimeError if SendGrid returns a non-202 status code.
-    """
+    """Send via SendGrid REST API. Raises on non-202 response."""
     api_key = os.environ.get("SENDGRID_API_KEY", "")
     from_email = os.environ.get("FROM_EMAIL", "")
-
     if not api_key:
-        raise EnvironmentError(
-            "SENDGRID_API_KEY environment variable is not set"
-        )
+        raise EnvironmentError("SENDGRID_API_KEY is not set")
     if not from_email:
-        raise EnvironmentError(
-            "FROM_EMAIL environment variable is not set"
-        )
-
-    payload = {
-        "personalizations": [
-            {
-                "to": [{"email": addr} for addr in RECIPIENTS],
-            }
-        ],
-        "from": {"email": from_email, "name": "Poshmark Suit Agent"},
-        "subject": subject,
-        "content": [{"type": "text/html", "value": html_body}],
-    }
+        raise EnvironmentError("FROM_EMAIL is not set")
 
     resp = requests.post(
         "https://api.sendgrid.com/v3/mail/send",
@@ -717,15 +673,19 @@ def send_email(subject: str, html_body: str) -> None:
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
-        json=payload,
+        json={
+            "personalizations": [{"to": [{"email": a} for a in RECIPIENTS]}],
+            "from": {"email": from_email, "name": "Poshmark Suit Agent"},
+            "subject": subject,
+            "content": [{"type": "text/html", "value": html_body}],
+        },
         timeout=30,
     )
-
     if resp.status_code != 202:
         raise RuntimeError(
             f"SendGrid returned HTTP {resp.status_code}: {resp.text[:500]}"
         )
-    log.info("Email sent successfully via SendGrid (202 Accepted)")
+    log.info("Email sent (SendGrid 202)")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -738,42 +698,29 @@ def main() -> None:
     log.info("Poshmark Monitor  —  %s UTC", now.strftime("%Y-%m-%d %H:%M"))
     log.info("=" * 60)
 
-    # 1. Scrape current listings across all designers
-    current: dict[str, dict] = fetch_all_listings()
+    current = fetch_all_listings()
 
     if not current:
-        log.warning(
-            "Zero listings found after all searches — "
-            "skipping email to avoid empty digest"
-        )
+        log.warning("Zero listings found — skipping email")
         return
 
-    # 2. Diff against previous run
-    previous: dict[str, dict] = load_state()
-    new_ids: set[str] = set(current.keys()) - set(previous.keys())
+    previous = load_state()
+    new_ids = set(current.keys()) - set(previous.keys())
     log.info(
         "Delta: %d total, %d new, %d removed",
-        len(current),
-        len(new_ids),
+        len(current), len(new_ids),
         len(set(previous.keys()) - set(current.keys())),
     )
 
-    # 3. Build email
     n_new = len(new_ids)
-    if n_new:
-        subject = (
-            f"\U0001F195 {n_new} new listing{'s' if n_new != 1 else ''}"
-            f" \u2013 Poshmark Suits ({run_date})"
-        )
-    else:
-        subject = f"Poshmark Suit Digest \u2013 {run_date}"
+    subject = (
+        f"\U0001F195 {n_new} new listing{'s' if n_new != 1 else ''}"
+        f" \u2013 Poshmark Suits ({run_date})"
+        if n_new else
+        f"Poshmark Suit Digest \u2013 {run_date}"
+    )
 
-    html_body = build_html_email(current, new_ids, run_date)
-
-    # 4. Send
-    send_email(subject, html_body)
-
-    # 5. Persist state (only after a successful send)
+    send_email(subject, build_html_email(current, new_ids, run_date))
     save_state(current)
     log.info("Run complete.")
 
