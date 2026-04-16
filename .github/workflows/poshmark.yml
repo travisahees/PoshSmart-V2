@@ -1,0 +1,63 @@
+name: Poshmark Monitor
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Triggers
+# ──────────────────────────────────────────────────────────────────────────────
+on:
+  # Run automatically every 2 days at 08:00 UTC.
+  # To change frequency, edit the cron expression:
+  #   every day:       "0 8 * * *"
+  #   every 3 days:    "0 8 */3 * *"
+  #   every week:      "0 8 * * 1"    (Mondays)
+  schedule:
+    - cron: "0 8 */2 * *"
+
+  # Allow manual triggering from the GitHub Actions tab (useful for testing).
+  workflow_dispatch:
+
+jobs:
+  scrape-and-email:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      # ── 1. Checkout source ────────────────────────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── 2. Restore cached listings state ─────────────────────────────────
+      # Uses a run-id-keyed primary entry (always a cache miss, so always
+      # saves at job end) with a prefix-based restore-keys fallback so the
+      # most recent previous run's state.json is loaded.
+      - name: Restore listings state
+        uses: actions/cache@v4
+        with:
+          path: state/listings.json
+          key: poshmark-state-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            poshmark-state-${{ runner.os }}-
+
+      # ── 3. Set up Python ──────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── 4. Install dependencies ───────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 5. Run the scraper ────────────────────────────────────────────────
+      # SENDGRID_API_KEY and FROM_EMAIL must be set as repository secrets:
+      # Settings → Secrets and variables → Actions → New repository secret
+      - name: Run Poshmark scraper
+        env:
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+        run: python scraper.py
+
+      # ── 6. Save updated listings state ───────────────────────────────────
+      # actions/cache@v4 auto-saves the path at job end when the primary key
+      # was a cache miss (which it always is due to the run_id suffix above).
+      - name: Persist listings state (auto-saved by cache action)
+        run: echo "state/listings.json will be saved by actions/cache on job completion"
