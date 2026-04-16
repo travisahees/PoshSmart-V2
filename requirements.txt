@@ -1,3 +1,6 @@
-requests>=2.31.0
-beautifulsoup4>=4.12.0
-lxml>=5.1.0
+      - name: Run Poshmark scraper
+        env:
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          SCRAPER_API_KEY: ${{ secrets.SCRAPER_API_KEY }}
+        run: python scraper.py
